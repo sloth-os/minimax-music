@@ -1,0 +1,44 @@
+# minimax-music service configuration.
+# Copy to config.yaml and fill in your values. Environment variables
+# (MINIMAX_*) override these values.
+
+# HTTP listen address for the API service.
+addr: ":8080"
+
+# MiniMaxi (Hailuo Audio) web client credentials and device fingerprint.
+# The token is required; obtain it from a logged-in browser session at
+# https://www.minimaxi.com (localStorage key "_token"). The uuid/device_id
+# should match the browser session you took the token from (DevTools ->
+# Application -> localStorage, or from any request's query string).
+minimax:
+  token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...."
+  op_ticket: ""           # usually empty for the web client
+  uuid: "c7140fab-2118-47cc-8941-c4d69c31c832"
+  device_id: ""           # may be empty; the browser sometimes omits it
+  lang: "zh-Hans"
+  os_name: "Windows"
+  browser_name: "edge"
+  device_memory: 16
+  cpu_core_num: 16
+  browser_language: "en-US"
+  browser_platform: "Win32"
+  screen_width: 1707
+  screen_height: 1067
+  app_id: "3001"
+  version_code: "22201"
+  biz_id: "1"
+  http_timeout: 30s
+  ws_timeout: 5m
+
+# Outbound proxy. Leave proxy_url empty for a direct connection.
+# Supported schemes: http://, https://, socks5://, socks5h:// (remote DNS).
+# Examples:
+#   proxy_url: "socks5h://127.0.0.1:1080"
+#   proxy_url: "http://user:pass@proxy.example.com:8080"
+#   proxy_url: "socks5h://user:pass@127.0.0.1:1080"
+proxy:
+  proxy_url: ""
+  username: ""            # overrides userinfo embedded in proxy_url
+  password: ""
+  dial_timeout: 15s
+  insecure_skip_verify: false   # only affects the proxy hop, not minimaxi/CDN TLS
