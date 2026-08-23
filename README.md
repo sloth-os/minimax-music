@@ -245,11 +245,21 @@ curl -N -X POST http://localhost:8080/api/generate \
   Algorithm:
   `yy = md5(encodeURIComponent(path+"?"+query) + "_" + bodyJSON + md5(unix) + "ooui")`
   where `bodyJSON` is `"{}"` for GET/WS and the raw POST body for POST, and the
-  millisecond `unix` timestamp is itself MD5-hashed before concatenation.
+  millisecond `unix` timestamp is itself MD5-hashed before concatenation. The
+  query is emitted in the browser's **insertion order** (not alphabetically
+  sorted) — `buildCommonParams` preserves the order
+  `device_platform, app_id, version_code, biz_id, uuid, lang, [device_id],
+  os_name, browser_name, ...` because the signature is computed over the exact
+  query string sent and the server compares against traffic signed in that
+  order (verified against the captured HAR: sorted order produces a different,
+  server-rejected signature).
 - **Generation** (`internal/minimax/generate.go`): opens `wss://.../v1/api/music/ws`
-  with the signed query, sends a `MusicGen` message, maintains a 12s heartbeat,
-  and reads hex-encoded MP3 chunks (`data[].audio`) until `ended=true`. The
-  chunks are hex-decoded and concatenated; the final `audio_url` is also captured.
+  with the signed query, sends a `MusicGen` message, and reads hex-encoded MP3
+  chunks (`data[].audio`) until `ended=true` (or an item reaches `status=2` with
+  an `audio_url`). Heartbeats are **server-initiated**: the server sends a
+  `Heartbeat` every ~15s and the client echoes it back with the same `msg_id`
+  and a fresh timestamp. The chunks are hex-decoded and concatenated; the final
+  `audio_url` is also captured.
 - **Download** (`internal/minimax/download.go`): plain GET to the CDN
   `audio_url` with a `Range: bytes=0-` header; no auth required.
 - **Proxy** (`internal/proxy/proxy.go`): builds an `*http.Client` and a

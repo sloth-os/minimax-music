@@ -2,11 +2,10 @@ package minimax
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -67,40 +66,34 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest, onChunk fun
 		return nil, fmt.Errorf("minimax: ws send MusicGen: %w", err)
 	}
 
-	// Heartbeat loop: the browser sends a Heartbeat every ~12s with the
-	// server's last msg_id and echoes it back. We send a heartbeat every 12s
-	// using the most recent server msg_id we've seen.
-	hbStop := make(chan struct{})
-	var lastServerMsgID string
-	var mu sync.Mutex
-	go func() {
-		ticker := time.NewTicker(12 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-hbStop:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				mu.Lock()
-				id := lastServerMsgID
-				mu.Unlock()
-				if id == "" {
-					continue
-				}
-				hb := struct {
-					Method    string `json:"method"`
-					MsgID     string `json:"msg_id"`
-					Timestamp int64  `json:"timestamp"`
-				}{Method: "Heartbeat", MsgID: id, Timestamp: nowMs()}
-				if b, err := compactJSON(hb); err == nil {
-					_ = conn.WriteMessage(websocket.TextMessage, b)
-				}
-			}
+	// Writes are guarded by writeMu because the read loop's heartbeat echoes
+	// share the conn with the initial MusicGen send.
+	var writeMu sync.Mutex
+	writeMsg := func(b []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteMessage(websocket.TextMessage, b)
+	}
+	hb := struct {
+		Method    string `json:"method"`
+		MsgID     string `json:"msg_id"`
+		Timestamp int64  `json:"timestamp"`
+	}{Method: "Heartbeat", MsgID: "", Timestamp: 0}
+	heartbeatResp := func(msgID string) {
+		hb.MsgID = msgID
+		hb.Timestamp = nowMs()
+		if b, err := compactJSON(hb); err == nil {
+			_ = writeMsg(b)
 		}
-	}()
-	defer close(hbStop)
+	}
+
+	// Heartbeat handling. Verified against www.minimaxi.com2.har: the heartbeat
+	// is SERVER-INITIATED. The server sends
+	//   {"method":"Heartbeat","msg_id":"<id>","timestamp":T1}
+	// roughly every 15s, and the client echoes it back with the SAME msg_id and
+	// a fresh timestamp:
+	//   {"method":"Heartbeat","msg_id":"<SAME>","timestamp":T2}
+	// So we do NOT proactively send heartbeats; we reply to each one we receive.
 
 	result := &GenerateResult{}
 	var audioBuf []byte
@@ -124,9 +117,11 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest, onChunk fun
 		}
 
 		if env.Method == "Heartbeat" {
-			mu.Lock()
-			lastServerMsgID = env.MsgID
-			mu.Unlock()
+			// Server-initiated keepalive: echo it back with the same msg_id and
+			// a fresh timestamp (matches the browser).
+			if env.MsgID != "" {
+				heartbeatResp(env.MsgID)
+			}
 			continue
 		}
 
@@ -156,31 +151,47 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest, onChunk fun
 				result.Items = upsertItem(result.Items, *it)
 			}
 		}
-		if env.Ended {
+		// Completion: the server signals done with ended=true. Some captures
+		// never reach ended=true, so also accept an item reaching status==2
+		// (server-side success) as a terminal state once audio_url is present.
+		if env.Ended || finalItemReady(&env) {
 			result.AudioData = audioBuf
 			return result, nil
 		}
 	}
 }
 
+// finalItemReady reports whether a MusicGen message indicates the first item is
+// complete (status 2 with a populated audio_url), which the server treats as a
+// terminal state equivalent to ended=true.
+func finalItemReady(env *wsEnvelope) bool {
+	if len(env.Data) == 0 {
+		return false
+	}
+	it := &env.Data[0]
+	return it.Status == 2 && it.AudioURL != ""
+}
+
 // dialWS opens the WebSocket connection with the signed query string.
+//
+// The browser builds the WS URL as: path?<common params in order>&yy&token&op_ticket
+// — i.e. yy/token/op_ticket are appended AFTER the common params (which are
+// what get signed), and op_ticket is always present (empty when unset).
 func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, error) {
 	now := nowMs()
 	// hasSearchParamsPath = path + "?" + common-params (NO yy/token/op_ticket).
-	hasPath := c.buildSearchParamsPath(WsPath, nil, now)
+	common := c.buildCommonParams(now)
+	hasPath := WsPath + "?" + encodeQuery(common)
 	yy := sign(hasPath, http.MethodGet, nil, now)
 
-	// Append yy, token, op_ticket to the query (matching the browser).
-	q, err := url.ParseQuery(strings.SplitN(hasPath, "?", 2)[1])
-	if err != nil {
-		return nil, err
-	}
-	q.Set("yy", yy)
-	q.Set("token", c.cfg.Token)
-	if c.cfg.OpTicket != "" {
-		q.Set("op_ticket", c.cfg.OpTicket)
-	}
-	wsURL := "wss://" + c.baseURL.Host + WsPath + "?" + q.Encode()
+	// Append yy, token, op_ticket to the wire query (matching the browser).
+	// op_ticket is always sent, even when empty.
+	wireParams := append(common[:len(common):len(common)],
+		queryParam{"yy", yy},
+		queryParam{"token", c.cfg.Token},
+		queryParam{"op_ticket", c.cfg.OpTicket},
+	)
+	wsURL := "wss://" + c.baseURL.Host + WsPath + "?" + encodeQuery(wireParams)
 
 	hdr := http.Header{}
 	hdr.Set("Origin", BaseURL)
@@ -220,12 +231,22 @@ func upsertItem(items []MusicItem, it MusicItem) []MusicItem {
 	return append(items, it)
 }
 
-// newMsgID returns a random UUIDv4-style message id. We avoid crypto/rand to
-// keep the dependency surface small; a time-based id is sufficient since the
-// server only echoes it back for heartbeats.
+// newMsgID returns a random RFC 4122 v4 UUID, matching the format the browser
+// sends for MusicGen msg_id (e.g. "cea36948-33db-460c-9f0a-b684a0550d58"). The
+// server echoes it back in Heartbeat messages; a real v4 avoids any chance of
+// collision with the server's own heartbeat ids.
 func newMsgID() string {
-	// Use a fixed-format pseudo-UUID. Uniqueness within a session is enough.
-	t := nowMs()
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		uint32(t), uint16(t>>16), uint16(t>>32), uint16(t>>48), uint64(t))
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fallback: time-based id. Uniqueness within a session is enough.
+		t := nowMs()
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			uint32(t), uint16(t>>16), uint16(t>>32), uint16(t>>48), uint64(t))
+	}
+	// RFC 4122 v4: set version (4) and variant (10xx).
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+		b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15])
 }

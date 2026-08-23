@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -20,13 +19,14 @@ import (
 // The signature contract (verified against the HAR):
 //   - yy = md5(encodeURIComponent(path+"?"+query) + "_" + bodyJSON + md5(unix) + "ooui")
 //   - bodyJSON is "{}" for GET, the raw POST body bytes for POST.
-//   - The query string we sign is EXACTLY the query string we send, so the
-//     canonical sorted encoding produced by url.Values.Encode is fine.
+//   - The query string we sign is EXACTLY the query string we send, in the
+//     browser's parameter insertion order (not alphabetically sorted) — see
+//     buildCommonParams.
 //
 // `token` and `yy` are sent as request headers (matching the browser). The
 // `unix` query param carries the same millisecond timestamp used in the
 // signature.
-func (c *Client) doRequest(ctx context.Context, method, path string, extra url.Values, body []byte) (*http.Response, error) {
+func (c *Client) doRequest(ctx context.Context, method, path string, extra []queryParam, body []byte) (*http.Response, error) {
 	if c.cfg.Token == "" {
 		return nil, fmt.Errorf("minimax: token is required")
 	}
@@ -67,7 +67,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, extra url.V
 }
 
 // doJSON executes a signed request and decodes the JSON response into out.
-func (c *Client) doJSON(ctx context.Context, method, path string, extra url.Values, body any, out any) error {
+func (c *Client) doJSON(ctx context.Context, method, path string, extra []queryParam, body any, out any) error {
 	var bodyBytes []byte
 	if body != nil {
 		b, err := compactJSON(body)
@@ -115,10 +115,13 @@ func (c *Client) HistoryList(ctx context.Context, page, pageSize int) (*HistoryR
 	if pageSize <= 0 {
 		pageSize = 20
 	}
-	q := url.Values{}
-	q.Set("is_favorite", "false")
-	q.Set("page", fmt.Sprintf("%d", page))
-	q.Set("page_size", fmt.Sprintf("%d", pageSize))
+	// Order matches the captured browser request: is_favorite, page, page_size
+	// before the common params.
+	q := []queryParam{
+		{"is_favorite", "false"},
+		{"page", fmt.Sprintf("%d", page)},
+		{"page_size", fmt.Sprintf("%d", pageSize)},
+	}
 	var resp HistoryResp
 	if err := c.doJSON(ctx, http.MethodGet, "/v1/api/music/history_list", q, nil, &resp); err != nil {
 		return nil, err
@@ -132,8 +135,9 @@ func (c *Client) HistoryList(ctx context.Context, page, pageSize int) (*HistoryR
 // CommonConfig fetches the web common config blob (base64-encoded JSON in the
 // raw response; decoded here into raw map). Kept for completeness/debugging.
 func (c *Client) CommonConfig(ctx context.Context) (map[string]any, error) {
-	q := url.Values{}
-	q.Set("filter", "t2a_input_config,voice_tag_language,voice_tag_gender,voice_tag_age,voice_tag_accent,default_selected_voice")
+	q := []queryParam{
+		{"filter", "t2a_input_config,voice_tag_language,voice_tag_gender,voice_tag_age,voice_tag_accent,default_selected_voice"},
+	}
 	var resp struct {
 		Data struct {
 			Config string `json:"config"`

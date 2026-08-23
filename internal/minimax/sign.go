@@ -85,68 +85,95 @@ func encodeURIComponent(s string) string {
 	return b.String()
 }
 
+// queryParam is an ordered query parameter. Unlike url.Values (a map that
+// re-sorts keys alphabetically on Encode), a slice preserves insertion order —
+// which the MiniMaxi signature requires (see buildCommonParams).
+type queryParam struct {
+	Key   string
+	Value string
+}
+
 // buildCommonParams returns the common query parameters every request carries,
 // matching the browser's mC() builder. The values come from the client config
 // (device id, uuid, language) and the current time.
-func (c *Client) buildCommonParams(nowMs int64) url.Values {
-	v := url.Values{}
-	v.Set("device_platform", "web")
-	v.Set("app_id", c.cfg.AppID)
-	v.Set("version_code", c.cfg.VersionCode)
-	v.Set("biz_id", c.cfg.BizID)
-	v.Set("uuid", c.cfg.UUID)
-	v.Set("lang", c.cfg.Lang)
-	if c.cfg.DeviceID != "" {
-		v.Set("device_id", c.cfg.DeviceID)
+//
+// ORDER MATTERS: the captured browser traffic sends these parameters in a
+// fixed insertion order, and the `yy` signature is computed over the raw query
+// string. Verified against www.minimaxi.com2.har — 0/16 captured signatures
+// match when the common params are sorted alphabetically (as url.Values.Encode
+// would produce); 16/16 match in this insertion order. We therefore preserve
+// the browser's order exactly rather than relying on a self-consistent sorted
+// encoding.
+func (c *Client) buildCommonParams(nowMs int64) []queryParam {
+	p := []queryParam{
+		{"device_platform", "web"},
+		{"app_id", c.cfg.AppID},
+		{"version_code", c.cfg.VersionCode},
+		{"biz_id", c.cfg.BizID},
+		{"uuid", c.cfg.UUID},
+		{"lang", c.cfg.Lang},
 	}
-	v.Set("os_name", c.cfg.OSName)
-	v.Set("browser_name", c.cfg.BrowserName)
+	// device_id sits between lang and os_name in the browser query, and is
+	// omitted entirely (not sent empty) when the device has not registered yet.
+	if c.cfg.DeviceID != "" {
+		p = append(p, queryParam{"device_id", c.cfg.DeviceID})
+	}
+	p = append(p,
+		queryParam{"os_name", c.cfg.OSName},
+		queryParam{"browser_name", c.cfg.BrowserName},
+	)
 	if c.cfg.DeviceMemory > 0 {
-		v.Set("device_memory", strconv.Itoa(c.cfg.DeviceMemory))
+		p = append(p, queryParam{"device_memory", strconv.Itoa(c.cfg.DeviceMemory)})
 	}
 	if c.cfg.CPUCoreNum > 0 {
-		v.Set("cpu_core_num", strconv.Itoa(c.cfg.CPUCoreNum))
+		p = append(p, queryParam{"cpu_core_num", strconv.Itoa(c.cfg.CPUCoreNum)})
 	}
 	if c.cfg.BrowserLanguage != "" {
-		v.Set("browser_language", c.cfg.BrowserLanguage)
+		p = append(p, queryParam{"browser_language", c.cfg.BrowserLanguage})
 	}
 	if c.cfg.BrowserPlatform != "" {
-		v.Set("browser_platform", c.cfg.BrowserPlatform)
+		p = append(p, queryParam{"browser_platform", c.cfg.BrowserPlatform})
 	}
 	if c.cfg.ScreenWidth > 0 {
-		v.Set("screen_width", strconv.Itoa(c.cfg.ScreenWidth))
+		p = append(p, queryParam{"screen_width", strconv.Itoa(c.cfg.ScreenWidth)})
 	}
 	if c.cfg.ScreenHeight > 0 {
-		v.Set("screen_height", strconv.Itoa(c.cfg.ScreenHeight))
+		p = append(p, queryParam{"screen_height", strconv.Itoa(c.cfg.ScreenHeight)})
 	}
-	v.Set("unix", strconv.FormatInt(nowMs, 10))
-	return v
+	p = append(p, queryParam{"unix", strconv.FormatInt(nowMs, 10)})
+	return p
+}
+
+// encodeQuery serializes ordered params as key=value pairs joined by '&',
+// matching the browser's URLSearchParams.toString() output (and Go's
+// url.QueryEscape). The common/extra param values in this client are simple
+// ASCII (alphanumerics, '-', '.', ':', '/'), so QueryEscape produces output
+// identical to the browser for every value actually sent.
+func encodeQuery(params []queryParam) string {
+	var b strings.Builder
+	for i, p := range params {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(url.QueryEscape(p.Key))
+		b.WriteByte('=')
+		b.WriteString(url.QueryEscape(p.Value))
+	}
+	return b.String()
 }
 
 // buildSearchParamsPath builds the "hasSearchParamsPath" value: the request
-// path with the merged query string appended. extra params (if any) are set
-// before the common params, mirroring the browser interceptor which does
-// e.params = {...e.params, ...mC(time)}.
+// path with the merged query string appended. extra params (if any) come before
+// the common params, mirroring the browser interceptor which does
+// `e.params = {...e.params, ...mC(time)}` (so the endpoint's own params keep
+// their position and the common params are appended after, in browser order).
 //
-// Note: url.Values.Encode() sorts keys alphabetically. The captured browser
-// traffic preserves insertion order, but the server validates the signature by
-// recomputing it from the *same* encoded query string it received — so as long
-// as we sign exactly the query string we send, the order is internally
-// consistent. We therefore sign the canonical (sorted) encoding and send that
-// same encoding on the wire.
-func (c *Client) buildSearchParamsPath(path string, extra url.Values, nowMs int64) string {
-	merged := url.Values{}
-	for k, vs := range extra {
-		for _, v := range vs {
-			merged.Add(k, v)
-		}
-	}
-	for k, vs := range c.buildCommonParams(nowMs) {
-		for _, v := range vs {
-			merged.Add(k, v)
-		}
-	}
-	q := merged.Encode()
+// The returned string is both what we sign AND what we send on the wire for
+// REST (REST carries yy/token as headers, not query). The WS dialer appends
+// yy/token/op_ticket to this base afterwards (see dialWS).
+func (c *Client) buildSearchParamsPath(path string, extra []queryParam, nowMs int64) string {
+	params := append(extra[:len(extra):len(extra)], c.buildCommonParams(nowMs)...)
+	q := encodeQuery(params)
 	if strings.Contains(path, "?") {
 		return path + "&" + q
 	}
