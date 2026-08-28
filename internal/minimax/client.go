@@ -67,6 +67,14 @@ func New(cfg Config, httpClient *http.Client) *Client {
 	if cfg.HTTPTimeout > 0 {
 		httpClient.Timeout = cfg.HTTPTimeout
 	}
+	// Wrap the transport so every outbound REST/CDN request is logged as a curl
+	// command with its backend response. Falls back to the default transport
+	// when the caller passed a client without one.
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &loggingTransport{base: transport}
 	cfg = withDefaults(cfg)
 	base, _ := url.Parse(BaseURL)
 	c := &Client{cfg: cfg, http: httpClient, baseURL: base}

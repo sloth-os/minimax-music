@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -197,8 +198,18 @@ func (c *Client) dialWS(ctx context.Context) (*websocket.Conn, error) {
 	hdr.Set("Origin", BaseURL)
 	hdr.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0")
 
-	conn, _, err := c.wsDialer.DialContext(ctx, wsURL, hdr)
-	return conn, err
+	log.Printf("[minimax] --> curl -X GET '%s' -H 'Origin: %s' -H 'User-Agent: %s'", redactURLQuery(wsURL), BaseURL, hdr.Get("User-Agent"))
+	conn, resp, err := c.wsDialer.DialContext(ctx, wsURL, hdr)
+	if err != nil {
+		log.Printf("[minimax] <-- ws dial error: %v", err)
+		return conn, err
+	}
+	// resp is the HTTP/101 Switching Protocols handshake response.
+	if resp != nil {
+		log.Printf("[minimax] <-- WS %d %s (upgrade=%s)", resp.StatusCode, redactURLQuery(wsURL), resp.Header.Get("Upgrade"))
+		resp.Body.Close()
+	}
+	return conn, nil
 }
 
 func normalizeRequest(r *GenerateRequest) *GenerateRequest {

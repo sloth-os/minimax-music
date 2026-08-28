@@ -68,8 +68,9 @@ func (s *Server) generator() MusicGenerator {
 	return s.client
 }
 
-// Handler returns the http.Handler to mount on an http.Server.
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the http.Handler to mount on an http.Server. It wraps the
+// mux in the request-log middleware so every received request is logged.
+func (s *Server) Handler() http.Handler { return requestLogMiddleware(s.mux) }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)
