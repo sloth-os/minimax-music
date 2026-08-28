@@ -1,0 +1,242 @@
+name: E2E (real MiniMax)
+
+# Real end-to-end test that drives the full stack:
+#
+#   smoke.py (mm-gateway repo)                 # the driver
+#     -> mm-gateway docker image (GHCR)         # the gateway under test
+#       -> minimax-music (go-built here)        # the upstream adapter
+#         -> real MiniMaxi WebSocket (token)    # the real provider
+#           -> real MP3 audio
+#
+# mm-gateway's minimax adapter calls the official MiniMax platform API
+# (POST /v1/music_generation, GenerateMusicReq/Resp), which this service
+# implements — so minimax-music is a drop-in upstream for the gateway. The
+# gateway is the PUBLISHED image ghcr.io/sloth-os/mm-gateway:latest (the
+# repo at github.com/sloth-os/mm-gateway); the smoke driver
+# (tests/e2e/smoke.py) is checked out from that same repo.
+#
+# The only credentials the live call needs are MINIMAX_TOKEN + MINIMAX_UUID
+# (the browser-session JWT + uuid). `device_id` is optional — the signing
+# client omits it when unset and the upstream still accepts the request
+# (verified against the live API). The gateway<->minimax-music hop uses a
+# dummy bearer (this service checks the Authorization header for presence
+# only, it does not forward the key upstream), so no upstream secret is
+# shared with the gateway container.
+#
+# Gating: the real call only runs when MINIMAX_TOKEN + MINIMAX_UUID are set
+# (i.e. on the sloth-os repo, not on fork PRs). When they are absent every
+# step after the detect step is skipped and the job is green — so the
+# workflow is green before the secrets exist and only spends a real provider
+# call once they are wired. The smoke script itself also exits 0 when no
+# candidate modality is fully configured, as a second line of defence.
+#
+# Topology: minimax-music runs as a host process on 127.0.0.1:8080; the
+# gateway container uses `--network host` so it reaches minimax-music over
+# loopback and is itself reachable by the smoke driver at 127.0.0.1:8000.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run-e2e:
+        description: "Force the real-provider e2e to run (requires secrets)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: read   # pull ghcr.io/sloth-os/mm-gateway
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Real-provider e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout minimax-music
+        uses: actions/checkout@v4
+
+      - name: Detect MiniMax credentials
+        # The live call needs MINIMAX_TOKEN + MINIMAX_UUID. They are repo
+        # secrets on sloth-os/minimax-music; a fork PR (or a run before they
+        # are set) sees them empty, so every step below this is skipped and
+        # the job stays green rather than failing on a missing secret.
+        id: creds
+        env:
+          TOKEN: ${{ secrets.MINIMAX_TOKEN }}
+          UUID: ${{ secrets.MINIMAX_UUID }}
+        run: |
+          if [ -n "$TOKEN" ] && [ -n "$UUID" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "MiniMax credentials present."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "MiniMax credentials absent — skipping real-provider e2e."
+          fi
+
+      - name: Set up Go
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        if: steps.creds.outputs.present == 'true'
+        run: go vet ./...
+
+      - name: Unit tests
+        # Self-contained: sign cases are hardcoded and the generation tests
+        # use a fake in-memory generator (no network). Guards the build
+        # before spending a real provider call.
+        if: steps.creds.outputs.present == 'true'
+        run: go test ./...
+
+      - name: Build minimax-music
+        if: steps.creds.outputs.present == 'true'
+        run: go build -o minimax-music .
+
+      - name: Checkout mm-gateway (for the smoke driver)
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: sloth-os/mm-gateway
+          path: mm-gateway
+          # The smoke driver + the published :latest image are kept in sync
+          # at the repo's default branch.
+          ref: main
+
+      - name: Start minimax-music (env-only, real upstream)
+        # Runs purely from env (config.yaml is gitignored, so it is absent in
+        # the checkout) with the real token/uuid. `device_id` is deliberately
+        # unset — the signing client omits it and the live API accepts the
+        # request, so this mirrors the minimal CI credential set.
+        if: steps.creds.outputs.present == 'true'
+        env:
+          MINIMAX_TOKEN: ${{ secrets.MINIMAX_TOKEN }}
+          MINIMAX_UUID: ${{ secrets.MINIMAX_UUID }}
+        run: |
+          mkdir -p artifacts
+          nohup ./minimax-music \
+            > artifacts/minimax-music.log 2>&1 &
+          echo $! > artifacts/minimax-music.pid
+          echo "minimax-music pid $(cat artifacts/minimax-music.pid)"
+
+      - name: Wait for minimax-music health
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -m 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "minimax-music healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::minimax-music did not become healthy"
+          tail -50 artifacts/minimax-music.log || true
+          exit 1
+
+      - name: Start mm-gateway
+        # The published image as the gateway under test. The minimax adapter
+        # is configured from the MINIMAX_MUSIC_* triple (legacy env layout):
+        # a dummy API key (this service checks Bearer presence only), the
+        # base URL of the host minimax-music, and the pinned free-tier model.
+        # `--network host` lets the container reach 127.0.0.1:8080 (the host
+        # process) and exposes the gateway at 127.0.0.1:8000 for the driver.
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          docker rm -f mm-gateway 2>/dev/null || true
+          docker run -d --name mm-gateway --network host \
+            -e GATEWAY_API_KEY=e2e-key \
+            -e MINIMAX_MUSIC_API_KEY=e2e-upstream-bearer \
+            -e MINIMAX_MUSIC_BASE_URL=http://127.0.0.1:8080 \
+            -e MINIMAX_MUSIC_MODEL=music-3.0-free \
+            -e LOG_FORMAT=text \
+            ghcr.io/sloth-os/mm-gateway:latest
+
+      - name: Wait for mm-gateway health
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          for i in $(seq 1 40); do
+            if curl -sf -m 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "mm-gateway healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::mm-gateway did not become healthy"
+          docker logs mm-gateway 2>&1 | tail -50 || true
+          exit 1
+
+      - name: Verify the pinned model is served
+        # The smoke driver skips any model absent from /v1/models (a backend
+        # whose provider failed to init). Asserting it up front turns a
+        # silent skip (false-green) into a hard failure.
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          served=$(curl -sf -m 10 -H 'Authorization: Bearer e2e-key' \
+            http://127.0.0.1:8000/v1/models | \
+            python3 -c 'import sys,json; print("\n".join(m["id"] for m in json.load(sys.stdin).get("data",[])))')
+          echo "$served" | grep -qx music-3.0-free || {
+            echo "::error::music-3.0-free not in /v1/models — gateway did not register the minimax backend"
+            echo "$served"
+            docker logs mm-gateway 2>&1 | tail -30 || true
+            exit 1
+          }
+          echo "music-3.0-free is served."
+
+      - name: Set up Python
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install smoke driver deps
+        if: steps.creds.outputs.present == 'true'
+        run: pip install --quiet httpx
+
+      - name: Run e2e smoke (real provider)
+        # The smoke driver needs the same MINIMAX_MUSIC_* triple in its OWN
+        # env to consider the (minimax, music) candidate "fully configured"
+        # (it gates on all three of api_key + base_url + model being set), in
+        # addition to the gateway needing them. E2E_BACKEND pins minimax and
+        # E2E_MUSIC_MODEL pins the free-tier model. A real generation takes
+        # ~1-2 min; E2E_MUSIC_TIMEOUT gives it headroom under the 15 min job.
+        if: steps.creds.outputs.present == 'true'
+        env:
+          MM_GATEWAY: http://127.0.0.1:8000
+          GATEWAY_API_KEY: e2e-key
+          E2E_BACKEND: minimax
+          E2E_MUSIC_MODEL: music-3.0-free
+          E2E_MUSIC_TIMEOUT: "300"
+          MINIMAX_MUSIC_API_KEY: e2e-upstream-bearer
+          MINIMAX_MUSIC_BASE_URL: http://127.0.0.1:8080
+          MINIMAX_MUSIC_MODEL: music-3.0-free
+        run: python mm-gateway/tests/e2e/smoke.py
+
+      - name: Dump logs on failure
+        if: failure() && steps.creds.outputs.present == 'true'
+        run: |
+          echo "===== mm-gateway logs ====="
+          docker logs mm-gateway 2>&1 | tail -80 || true
+          echo "===== minimax-music logs ====="
+          tail -80 artifacts/minimax-music.log || true
+
+      - name: Stop mm-gateway
+        if: always() && steps.creds.outputs.present == 'true'
+        run: docker rm -f mm-gateway 2>/dev/null || true
+
+      - name: Stop minimax-music
+        if: always() && steps.creds.outputs.present == 'true'
+        run: |
+          if [ -f artifacts/minimax-music.pid ]; then
+            kill "$(cat artifacts/minimax-music.pid)" 2>/dev/null || true
+          fi
