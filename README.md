@@ -32,6 +32,35 @@ go build -o minimax-music .
 Requires Go 1.24+. Dependencies: `github.com/gorilla/websocket`,
 `golang.org/x/net` (SOCKS5), `gopkg.in/yaml.v3`.
 
+## Docker
+
+A published multi-arch image (`linux/amd64` + `linux/arm64`) is built and
+pushed to GHCR on every push to `main` and on `v*` tags (workflow:
+`.github/workflows/docker.yml`).
+
+```bash
+# Pull the published image (latest from main):
+docker pull ghcr.io/sloth-os/minimax-music:latest
+
+# Run it — config is env-first, no config file needed in the image:
+docker run -d -p 8080:8080 \
+  -e MINIMAX_TOKEN=<jwt> \
+  -e MINIMAX_UUID=<browser-uuid> \
+  ghcr.io/sloth-os/minimax-music:latest
+```
+
+Tags: `:latest` and `:main` track the default branch; `:1.2.3`/`:1.2`/`:1`
+are produced from `v1.2.3` tags; `:sha-<short>` pins a commit. PRs build the
+image (validating the multi-arch matrix) but never publish.
+
+The image is a static Go binary on a non-root `distroless` base (no shell).
+Build it locally for both architectures with Buildx (no per-arch C toolchain —
+Go cross-compiles natively):
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t minimax-music .
+```
+
 ## Configure
 
 Copy `config.example.yaml` to `config.yaml` and fill in your values, or use

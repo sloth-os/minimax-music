@@ -1,0 +1,121 @@
+# Build and publish the minimax-music Docker image to GHCR.
+#
+# Produces a single multi-arch image (linux/amd64 + linux/arm64) so the
+# service runs on x86 runners/VMs and on Apple Silicon / arm64 hosts alike.
+# The Dockerfile cross-compiles the Go binary per platform (no QEMU), so the
+# multi-arch matrix is fast.
+#
+# Tagging (docker/metadata-action):
+#   main push      -> :main, :sha-<short>, :latest   (:latest = tested tip of main)
+#   v1.2.3 tag     -> :1.2.3, :1.2, :1                (immutable semver)
+#   pull_request   -> :pr-<n>                         (build only, NOT pushed)
+#
+# :latest tracks the default branch (matches the ghcr.io/sloth-os/mm-gateway
+# convention — :latest is the repo default-branch tip, not "newest release tag").
+# Cut release tags from the main tip so :latest == the released commit.
+#
+# Publish target: ghcr.io/sloth-os/minimax-music (lowercased repo name).
+# Authentication: the auto-provisioned GITHUB_TOKEN (scope packages:write).
+
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # push images to ghcr.io/<owner>/<repo>
+
+# Cancel a superseded run on the same ref so re-pushes don't queue up.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        # GHCR requires an all-lowercase owner/repo. GITHUB_REPOSITORY is lower
+        # for sloth-os/minimax-music today; lowercasing makes it robust to a
+        # renamed org and avoids the silent 400 from mixed-case names.
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        # Needed for any non-native platform arch the buildx graph can't satisfy
+        # by cross-compiling alone (the Go build stage is pure cross-compile, but
+        # QEMU is the safe default for multi-arch manifests).
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        # Only authenticate when we will actually push. PRs build but never
+        # publish (and fork PRs have no GITHUB_TOKEN with packages:write for the
+        # base repo), so skipping login there avoids both a failed step and an
+        # accidental publish from an untrusted source.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # Build on PRs (validates the Dockerfile + multi-arch matrix) but do
+          # NOT push — PRs must not publish images.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache for build layers: faster incremental builds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # A clean manifest list (no provenance attestation) keeps the tag a
+          # plain multi-arch image that pulls cleanly under docker/k8s/compose.
+          provenance: false
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Docker image" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "Built (not pushed) for PR #${{ github.event.pull_request.number }} — validated Dockerfile + multi-arch matrix." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Pushed \`${{ steps.img.outputs.name }}\` for platforms linux/amd64, linux/arm64." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

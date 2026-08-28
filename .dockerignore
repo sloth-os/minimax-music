@@ -1,0 +1,24 @@
+# Keep secrets and local artifacts out of the Docker build context.
+# (Independent of .gitignore: docker build uses the working tree, not git.)
+
+# Live config + captured traffic (contains the JWT token).
+config.yaml
+.env
+*.har
+
+# Built binary and test artifacts.
+minimax-music
+*.test
+*.out
+*.coverprofile
+profile.cov
+coverage.*
+
+# Logs and local state.
+*.log
+artifacts/
+
+# VCS and CI (not needed to build the binary).
+.git
+.gitignore
+.github
