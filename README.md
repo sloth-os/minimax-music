@@ -71,6 +71,32 @@ stores in `localStorage` under `_token` on `https://www.minimaxi.com`. You
 should also set `minimax.uuid` to the same browser session's uuid (visible in
 any request's query string in DevTools).
 
+### Inbound authentication
+
+By default the service is **open**: anyone who can reach it can generate and
+download music using your configured MiniMax token. To gate inbound requests,
+set **`auth.api_key`** (`MINIMAX_AUTH_API_KEY`). When set, every request must
+carry the header:
+
+```
+Authorization: Bearer <api_key>
+```
+
+- Missing or mismatched tokens are rejected (`401` on `/api/*`; the official
+  `/v1/music_generation` endpoint answers `200` with
+  `base_resp.status_code = 1004` per its schema instead).
+- `/healthz` stays open so liveness probes are not gated on credentials.
+- The comparison is constant-time. Brute-forcing a short key is trivial — use a
+  long random string.
+- With no key configured, auth is off (the historical default) and the
+  `/v1/music_generation` schema check still requires the header's *presence*
+  for conformance without validating its value.
+
+```yaml
+auth:
+  api_key: "long-random-string"
+```
+
 ### Proxy
 
 Set `proxy.proxy_url` (or `MINIMAX_PROXY_URL`) to route all traffic through a
@@ -108,8 +134,10 @@ service unchanged.
 - `Content-Type: application/json`
 - `Authorization: Bearer <api_key>` — required for schema conformance. This
   service wraps the web client (which authenticates with a configured JWT, not
-  the caller's key), so the key is checked for presence/format but is not
-  forwarded upstream.
+  the caller's key), so the key gates access to this service only and is not
+  forwarded upstream. When inbound auth is configured (`auth.api_key`) the token
+  must match it; otherwise its presence is required for schema conformance but
+  the value is not validated.
 
 **Body** (`GenerateMusicReq`, only `model` is required):
 

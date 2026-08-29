@@ -5,6 +5,14 @@
 # HTTP listen address for the API service.
 addr: ":8080"
 
+# Inbound request authentication. Set api_key to require every caller to send
+# "Authorization: Bearer <api_key>" (all paths except /healthz and
+# /v1/music_generation, which answers auth failures per the MiniMax schema).
+# Leave api_key empty to run open (anyone who can reach the service can use
+# it). Brute-forcing a short key is trivial — use a long random value.
+auth:
+  api_key: ""
+
 # MiniMaxi (Hailuo Audio) web client credentials and device fingerprint.
 # The token is required; obtain it from a logged-in browser session at
 # https://www.minimaxi.com (localStorage key "_token"). The uuid/device_id

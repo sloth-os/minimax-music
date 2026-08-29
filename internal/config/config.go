@@ -20,6 +20,11 @@ type Config struct {
 	// Addr is the HTTP listen address. Default ":8080".
 	Addr string `json:"addr" yaml:"addr"`
 
+	// Auth holds inbound request authentication. When Auth.APIKey is set, every
+	// received request (except /healthz) must carry
+	// "Authorization: Bearer <api_key>". Empty = open (no auth).
+	Auth Auth `json:"auth" yaml:"auth"`
+
 	// Minimax holds the MiniMaxi client credentials/fingerprint.
 	Minimax minimax.Config `json:"minimax" yaml:"minimax"`
 
@@ -27,15 +32,23 @@ type Config struct {
 	Proxy proxy.Config `json:"proxy" yaml:"proxy"`
 }
 
+// Auth holds inbound request authentication.
+type Auth struct {
+	// APIKey is the shared secret callers must present as
+	// "Authorization: Bearer <api_key>". When empty, inbound auth is disabled
+	// (the service is open to anyone who can reach it).
+	APIKey string `json:"api_key" yaml:"api_key"`
+}
+
 // Load reads the YAML file at path (if non-empty and present) and then applies
-// environment-variable overrides. Env vars use the prefix MINIMAX_ and match
-// the YAML keys with dots replaced by underscores, e.g.:
+// environment-variable overrides. Env vars use the prefix MINIMAX_, e.g.:
 //
 //	MINIMAX_ADDR
-//	MINIMAX_MINIMAX_TOKEN
-//	MINIMAX_MINIMAX_UUID
-//	MINIMAX_MINIMAX_DEVICE_ID
-//	MINIMAX_PROXY_PROXY_URL
+//	MINIMAX_AUTH_API_KEY
+//	MINIMAX_TOKEN
+//	MINIMAX_UUID
+//	MINIMAX_DEVICE_ID
+//	MINIMAX_PROXY_URL
 //	MINIMAX_PROXY_USERNAME
 //	MINIMAX_PROXY_PASSWORD
 func Load(path string) (*Config, error) {
@@ -64,6 +77,9 @@ func Load(path string) (*Config, error) {
 func applyEnv(cfg *Config) {
 	if v := os.Getenv("MINIMAX_ADDR"); v != "" {
 		cfg.Addr = v
+	}
+	if v := os.Getenv("MINIMAX_AUTH_API_KEY"); v != "" {
+		cfg.Auth.APIKey = v
 	}
 	if v := os.Getenv("MINIMAX_TOKEN"); v != "" {
 		cfg.Minimax.Token = v
@@ -108,6 +124,11 @@ func applyEnv(cfg *Config) {
 func (c *Config) String() string {
 	var b strings.Builder
 	b.WriteString("addr=" + c.Addr)
+	if c.Auth.APIKey != "" {
+		b.WriteString(" auth=<set>")
+	} else {
+		b.WriteString(" auth=open")
+	}
 	if c.Minimax.Token != "" {
 		b.WriteString(" token=<set>")
 	} else {

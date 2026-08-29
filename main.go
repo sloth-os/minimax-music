@@ -65,6 +65,7 @@ func main() {
 
 	// Build the API server.
 	srv := api.New(client)
+	srv.SetAuthKey(cfg.Auth.APIKey)
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           srv.Handler(),

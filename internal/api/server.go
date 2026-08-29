@@ -31,7 +31,10 @@ type Server struct {
 	// gen overrides the client for the /v1/music_generation endpoint when set
 	// (used by tests). When nil, the real client is used.
 	gen MusicGenerator
-	mux *http.ServeMux
+	// apiKey gates inbound requests behind "Authorization: Bearer <apiKey>"
+	// when non-empty. It is the only credential callers ever present.
+	apiKey string
+	mux    *http.ServeMux
 }
 
 // MusicGenerator is the subset of the minimax client used by the official
@@ -56,6 +59,16 @@ func New(client *minimax.Client) *Server {
 	return s
 }
 
+// SetAuthKey configures a shared secret that callers must present as
+// "Authorization: Bearer <key>" on every request except /healthz and
+// /v1/music_generation (which answers auth failures per the official schema).
+// When unset, inbound auth is disabled (open access). It should be called before
+// Handler().
+func (s *Server) SetAuthKey(key string) { s.apiKey = key }
+
+// APIKey returns the configured inbound auth key (empty when auth is off).
+func (s *Server) APIKey() string { return s.apiKey }
+
 // SetGenerator installs a custom MusicGenerator for the /v1/music_generation
 // endpoint (primarily for testing).
 func (s *Server) SetGenerator(g MusicGenerator) { s.gen = g }
@@ -69,8 +82,14 @@ func (s *Server) generator() MusicGenerator {
 }
 
 // Handler returns the http.Handler to mount on an http.Server. It wraps the
-// mux in the request-log middleware so every received request is logged.
-func (s *Server) Handler() http.Handler { return requestLogMiddleware(s.mux) }
+// mux in the bearer-auth middleware (gating all paths except /healthz and
+// /v1/music_generation when a key is configured) and then the request-log
+// middleware so every received request is logged.
+func (s *Server) Handler() http.Handler {
+	h := http.Handler(s.mux)
+	h = bearerAuthMiddleware(s.apiKey, h)
+	return requestLogMiddleware(h)
+}
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/healthz", s.handleHealth)

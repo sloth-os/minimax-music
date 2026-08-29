@@ -44,10 +44,20 @@ func (s *Server) handleMusicGeneration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Authorization: Bearer <key> is required by the spec. This service wraps
-	// the web client (which uses a configured JWT, not the caller's key), so we
-	// require the header's presence for schema conformance but do not forward
-	// the value. Missing/invalid => 1004 auth failed, returned as a 200 body.
-	if !strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ") {
+	// the web client (which uses a configured JWT, not the caller's key), so the
+	// key is not forwarded upstream: it gates access to this service only.
+	//
+	// When this service has a configured inbound auth key (SetAuthKey), the
+	// caller's token must match it (constant-time). Otherwise — open mode — the
+	// header's presence is still required for schema conformance (spec clients
+	// always send it). Missing/invalid => 1004 auth failed, returned as a 200
+	// body per the spec's single-200-response contract.
+	if s.apiKey != "" {
+		if !bearerTokenOK(r, s.apiKey) {
+			writeMDResp(w, http.StatusOK, StatusAuthFailed, "missing or invalid Authorization header (expected 'Bearer <api_key>')")
+			return
+		}
+	} else if !strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ") {
 		writeMDResp(w, http.StatusOK, StatusAuthFailed, "missing or invalid Authorization header (expected 'Bearer <api_key>')")
 		return
 	}
