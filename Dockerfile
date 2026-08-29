@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage, multi-arch image for minimax-music.
 #
-# Produces a single static binary on a distroless base, so one buildx matrix
-# step yields a working image for every supported platform (linux/amd64,
-# linux/arm64) with no per-arch C toolchain. buildx injects TARGETOS/
-# TARGETARCH per platform; Go cross-compiles natively (no QEMU), so multi-arch
-# builds stay fast.
+# Produces a single static binary on a distroless base for every supported
+# platform (linux/amd64, linux/arm64) with no per-arch C toolchain. Each
+# platform slice runs its matching golang:1.24 image (the arm64 slice under
+# QEMU), and buildx injects TARGETOS/TARGETARCH so Go builds for that slice's
+# arch. The artifact is fully static, so it runs on the distroless runtime base
+# unchanged on any arch.
+#
+# TARGETOS/TARGETARCH are declared WITHOUT a default on purpose. A default
+# (e.g. `ARG TARGETARCH=amd64`) shadows buildx's per-platform injection: every
+# slice then builds with GOARCH=amd64, so the arm64 manifest ships an amd64
+# binary and fails on arm64 hosts with "exec format error".
 
 # --- build stage -------------------------------------------------------------
 FROM golang:1.24 AS build
@@ -20,9 +26,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Source + build. CGO is off and debug info is stripped, so the artifact is
 # fully static and runs on a no-libc base on any arch. The cache mounts on
 # /go/pkg/mod and the go-build cache keep incremental rebuilds fast.
+#
+# TARGETOS/TARGETARCH get NO default here: a default would shadow buildx's
+# per-platform value (see header) and break the arm64 slice.
 COPY . .
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
